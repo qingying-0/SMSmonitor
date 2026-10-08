@@ -41,14 +41,58 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 import org.qingyingqx.smsmonitor.ui.theme.*
 
+/**
+ * 短信权限的三态。
+ *
+ * 之所以不是 Boolean：`RECEIVE_SMS` 与 `READ_SMS` 是两个独立权限，可以被单独授予。
+ * 只有 `RECEIVE_SMS` 时广播通道仍然可用，但 ContentObserver 兜底通道会**静默失效**——
+ * 这是一个必须让用户看见的"降级"状态，不能简单地显示为"已就绪"。
+ */
+enum class SmsPermission {
+    /** 两条权限都已授予：双通道完整可用 */
+    FULL,
+
+    /** 只有接收权限：广播通道可用，ContentObserver 兜底通道不可用 */
+    RECEIVE_ONLY,
+
+    /** 两条都没有：监控完全无法工作 */
+    NONE
+}
+
+/** 状态灯级别 */
+enum class StatusLevel {
+    OK,
+    DEGRADED,
+    BAD
+}
+
+/**
+ * 由两条权限的授予情况推导短信权限状态。
+ *
+ * 抽成纯函数是为了能在 JVM 上直接单测——这段映射决定了界面会不会把
+ * "兜底通道已失效"误报成"已就绪"，是最值得固定下来的逻辑之一。
+ */
+fun resolveSmsPermission(receiveGranted: Boolean, readGranted: Boolean): SmsPermission = when {
+    receiveGranted && readGranted -> SmsPermission.FULL
+    receiveGranted -> SmsPermission.RECEIVE_ONLY
+    else -> SmsPermission.NONE
+}
+
 class MainActivity : ComponentActivity() {
 
     // 可观察状态
     private val isMonitoringEnabled = mutableStateOf(false)
     private val isServiceRunning = mutableStateOf(false)
     private val hasExactAlarmPermission = mutableStateOf(true)
-    private val hasSmsPermission = mutableStateOf(false)
+    private val smsPermission = mutableStateOf(SmsPermission.NONE)
     private val hasNotificationPermission = mutableStateOf(true)
+
+    /**
+     * 权限是否已被"永久拒绝"（用户勾选了"不再询问"）。
+     * 此时再调用系统弹窗不会有任何反应，必须改为引导去系统设置页。
+     */
+    private val smsPermissionBlocked = mutableStateOf(false)
+    private val notificationPermissionBlocked = mutableStateOf(false)
 
     /** 每次回到前台自增，驱动 Compose 重新读取监控日志 */
     private val logRefreshTick = mutableStateOf(0)
@@ -87,8 +131,10 @@ class MainActivity : ComponentActivity() {
                     color = InkBackground
                 ) {
                     HomePage(
-                        hasSmsPermission = hasSmsPermission.value,
+                        smsPermission = smsPermission.value,
+                        smsPermissionBlocked = smsPermissionBlocked.value,
                         hasNotificationPermission = hasNotificationPermission.value,
+                        notificationPermissionBlocked = notificationPermissionBlocked.value,
                         hasExactAlarmPermission = hasExactAlarmPermission.value,
                         isMonitoringEnabled = isMonitoringEnabled.value,
                         isServiceRunning = isServiceRunning.value,
@@ -122,18 +168,30 @@ class MainActivity : ComponentActivity() {
         smsPermissionLauncher = registerForActivityResult(
             ActivityResultContracts.RequestMultiplePermissions()
         ) { permissions ->
+            // 留痕：之后才能区分"从未申请"与"已被永久拒绝"
+            markPermissionAsked(Prefs.KEY_PERM_SMS_ASKED)
             checkPermissions()
             val allGranted = permissions.values.all { it }
             if (allGranted) {
                 Toast.makeText(this, "权限已授予", Toast.LENGTH_SHORT).show()
             } else {
-                Toast.makeText(this, "部分权限被拒绝，功能可能受限", Toast.LENGTH_SHORT).show()
+                val partial = smsPermission.value == SmsPermission.RECEIVE_ONLY
+                Toast.makeText(
+                    this,
+                    if (partial) {
+                        "仅授予了接收短信权限，兜底通道不可用，建议补充「读取短信」权限"
+                    } else {
+                        "部分权限被拒绝，功能可能受限"
+                    },
+                    Toast.LENGTH_LONG
+                ).show()
             }
         }
 
         notificationPermissionLauncher = registerForActivityResult(
             ActivityResultContracts.RequestPermission()
         ) { granted ->
+            markPermissionAsked(Prefs.KEY_PERM_NOTIFICATION_ASKED)
             checkPermissions()
             if (granted) {
                 Toast.makeText(this, "通知权限已授予", Toast.LENGTH_SHORT).show()
@@ -143,15 +201,57 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** 权限是否已授予 */
+    private fun isGranted(permission: String): Boolean =
+        ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+
+    /** 记录"已弹过申请框"，用于判定永久拒绝 */
+    private fun markPermissionAsked(key: String) {
+        getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)
+            .edit().putBoolean(key, true).apply()
+    }
+
+    /**
+     * 判断权限是否已被"永久拒绝"（用户勾选了"不再询问"）。
+     *
+     * `shouldShowRequestPermissionRationale()` 在"从未申请过"和"已被永久拒绝"
+     * 两种情况下**都**返回 false，因此必须结合"是否申请过"这个持久化标志才能区分。
+     * 只有确实申请过、仍未授予、且系统不再愿意展示理由时，才认定为永久拒绝。
+     */
+    private fun isPermanentlyDenied(
+        askedKey: String,
+        stillMissing: Boolean,
+        vararg permissions: String
+    ): Boolean {
+        if (!stillMissing) return false
+
+        val asked = getSharedPreferences(Prefs.NAME, Context.MODE_PRIVATE)
+            .getBoolean(askedKey, false)
+        if (!asked) return false
+
+        return permissions.none { shouldShowRequestPermissionRationale(it) }
+    }
+
     private fun checkPermissions() {
-        hasSmsPermission.value = ContextCompat.checkSelfPermission(
-            this, Manifest.permission.RECEIVE_SMS
-        ) == PackageManager.PERMISSION_GRANTED
+        val receiveGranted = isGranted(Manifest.permission.RECEIVE_SMS)
+        val readGranted = isGranted(Manifest.permission.READ_SMS)
+
+        // READ_SMS 缺失时 ContentObserver 通道无法工作，属于"降级"而非"不可用"
+        smsPermission.value = resolveSmsPermission(receiveGranted, readGranted)
+        smsPermissionBlocked.value = isPermanentlyDenied(
+            Prefs.KEY_PERM_SMS_ASKED,
+            smsPermission.value != SmsPermission.FULL,
+            Manifest.permission.RECEIVE_SMS,
+            Manifest.permission.READ_SMS
+        )
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            hasNotificationPermission.value = ContextCompat.checkSelfPermission(
-                this, Manifest.permission.POST_NOTIFICATIONS
-            ) == PackageManager.PERMISSION_GRANTED
+            hasNotificationPermission.value = isGranted(Manifest.permission.POST_NOTIFICATIONS)
+            notificationPermissionBlocked.value = isPermanentlyDenied(
+                Prefs.KEY_PERM_NOTIFICATION_ASKED,
+                !hasNotificationPermission.value,
+                Manifest.permission.POST_NOTIFICATIONS
+            )
         }
 
         // 加载监控开关状态
@@ -165,8 +265,9 @@ class MainActivity : ComponentActivity() {
         logRefreshTick.value = logRefreshTick.value + 1
 
         if (enabled) {
-            // 自愈：开关为开但服务已被 ROM 清理，回到前台时重新拉起
-            if (!SmsMonitorService.isRunning && hasSmsPermission.value) {
+            // 自愈：开关为开但服务已被 ROM 清理，回到前台时重新拉起。
+            // 只要能收到广播就值得拉起服务，因此 RECEIVE_ONLY 也启动。
+            if (!SmsMonitorService.isRunning && smsPermission.value != SmsPermission.NONE) {
                 SmsMonitorService.start(this)
             }
         }
@@ -187,6 +288,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestSmsPermission() {
+        // 已被永久拒绝：系统弹窗不会再出现，只能引导去设置页
+        if (smsPermissionBlocked.value) {
+            Toast.makeText(this, "短信权限已被拒绝，请在「权限」中手动开启", Toast.LENGTH_LONG).show()
+            openAppDetails()
+            return
+        }
+
         smsPermissionLauncher.launch(
             arrayOf(
                 Manifest.permission.RECEIVE_SMS,
@@ -196,15 +304,22 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+
+        // 同上：永久拒绝后系统弹窗不再出现
+        if (notificationPermissionBlocked.value) {
+            Toast.makeText(this, "通知权限已被拒绝，请在「通知」中手动开启", Toast.LENGTH_LONG).show()
+            openAppDetails()
+            return
         }
+
+        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 
     private fun toggleMonitoring() {
         val target = !isMonitoringEnabled.value
 
-        if (target && !hasSmsPermission.value) {
+        if (target && smsPermission.value == SmsPermission.NONE) {
             Toast.makeText(this, "请先授予短信权限", Toast.LENGTH_SHORT).show()
             return
         }
@@ -223,7 +338,16 @@ class MainActivity : ComponentActivity() {
             mainHandler.postDelayed({
                 isServiceRunning.value = SmsMonitorService.isRunning
             }, SERVICE_START_VERIFY_MS)
-            Toast.makeText(this, "监控已启用（双通道 + 守护）", Toast.LENGTH_SHORT).show()
+            // 降级状态必须明确告知：此时只有广播通道在工作
+            if (smsPermission.value == SmsPermission.RECEIVE_ONLY) {
+                Toast.makeText(
+                    this,
+                    "监控已启用，但缺少「读取短信」权限，ContentObserver 兜底通道未生效",
+                    Toast.LENGTH_LONG
+                ).show()
+            } else {
+                Toast.makeText(this, "监控已启用（双通道 + 守护）", Toast.LENGTH_SHORT).show()
+            }
         } else {
             // 完整关闭：清开关 + 撤中转闹钟 + 停闹钟 + 停守护 + 停服务
             SmsMonitorService.shutdown(this)
@@ -289,8 +413,10 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun HomePage(
-    hasSmsPermission: Boolean,
+    smsPermission: SmsPermission,
+    smsPermissionBlocked: Boolean,
     hasNotificationPermission: Boolean,
+    notificationPermissionBlocked: Boolean,
     hasExactAlarmPermission: Boolean,
     isMonitoringEnabled: Boolean,
     isServiceRunning: Boolean,
@@ -493,7 +619,8 @@ fun HomePage(
 
             // 运行状态卡片
             StatusCard(
-                hasSmsPermission = hasSmsPermission,
+                smsPermission = smsPermission,
+                smsPermissionBlocked = smsPermissionBlocked,
                 hasNotificationPermission = hasNotificationPermission,
                 hasExactAlarmPermission = hasExactAlarmPermission,
                 isMonitoringEnabled = isMonitoringEnabled,
@@ -505,24 +632,40 @@ fun HomePage(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                if (!hasSmsPermission) {
+                if (smsPermission != SmsPermission.FULL) {
                     Button(
                         onClick = onRequestSmsPermission,
                         modifier = Modifier.weight(1f),
-                        colors = ButtonDefaults.buttonColors(containerColor = InkPrimary),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (smsPermissionBlocked) InkWarningSoft else InkPrimary,
+                            contentColor = if (smsPermissionBlocked) InkWarning else InkOnPrimary
+                        ),
                         shape = RoundedCornerShape(12.dp)
                     ) {
-                        Text("申请短信权限")
+                        Text(
+                            when {
+                                smsPermissionBlocked -> "去设置开权限"
+                                smsPermission == SmsPermission.RECEIVE_ONLY -> "补充短信权限"
+                                else -> "申请短信权限"
+                            }
+                        )
                     }
                 }
                 if (!hasNotificationPermission) {
                     Button(
                         onClick = onRequestNotificationPermission,
                         modifier = Modifier.weight(1f),
-                        colors = ButtonDefaults.buttonColors(containerColor = InkPrimary),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (notificationPermissionBlocked) {
+                                InkWarningSoft
+                            } else {
+                                InkPrimary
+                            },
+                            contentColor = if (notificationPermissionBlocked) InkWarning else InkOnPrimary
+                        ),
                         shape = RoundedCornerShape(12.dp)
                     ) {
-                        Text("申请通知权限")
+                        Text(if (notificationPermissionBlocked) "去设置开通知" else "申请通知权限")
                     }
                 }
                 if (!hasExactAlarmPermission) {
@@ -891,7 +1034,8 @@ fun CheckTaskDialog(
 
 @Composable
 fun StatusCard(
-    hasSmsPermission: Boolean,
+    smsPermission: SmsPermission,
+    smsPermissionBlocked: Boolean,
     hasNotificationPermission: Boolean,
     hasExactAlarmPermission: Boolean,
     isMonitoringEnabled: Boolean,
@@ -910,11 +1054,38 @@ fun StatusCard(
                 color = InkOnSurface,
                 modifier = Modifier.padding(bottom = 12.dp)
             )
-            StatusItem(label = "短信权限", isOk = hasSmsPermission)
-            StatusItem(label = "通知权限", isOk = hasNotificationPermission)
-            StatusItem(label = "精准闹钟", isOk = hasExactAlarmPermission)
-            StatusItem(label = "监控开关", isOk = isMonitoringEnabled)
-            StatusItem(label = "监控服务常驻", isOk = isServiceRunning)
+            StatusItem(
+                label = "短信权限",
+                level = when (smsPermission) {
+                    SmsPermission.FULL -> StatusLevel.OK
+                    SmsPermission.RECEIVE_ONLY -> StatusLevel.DEGRADED
+                    SmsPermission.NONE -> StatusLevel.BAD
+                },
+                hint = when (smsPermission) {
+                    SmsPermission.FULL -> null
+                    SmsPermission.RECEIVE_ONLY ->
+                        "只能收到广播，缺少「读取短信」权限，ContentObserver 兜底通道未生效"
+                    SmsPermission.NONE ->
+                        if (smsPermissionBlocked) "已被拒绝，请到系统设置中手动开启" else "监控无法工作"
+                }
+            )
+            StatusItem(
+                label = "通知权限",
+                level = if (hasNotificationPermission) StatusLevel.OK else StatusLevel.BAD
+            )
+            StatusItem(
+                label = "精准闹钟",
+                level = if (hasExactAlarmPermission) StatusLevel.OK else StatusLevel.DEGRADED,
+                hint = if (hasExactAlarmPermission) null else "定时检查将仅依赖 15 分钟兜底巡检"
+            )
+            StatusItem(
+                label = "监控开关",
+                level = if (isMonitoringEnabled) StatusLevel.OK else StatusLevel.BAD
+            )
+            StatusItem(
+                label = "监控服务常驻",
+                level = if (isServiceRunning) StatusLevel.OK else StatusLevel.BAD
+            )
 
             Spacer(modifier = Modifier.height(12.dp))
            
@@ -1194,32 +1365,62 @@ fun AlarmLogDialog(
     )
 }
 
+/** 状态灯文案 */
+private fun statusText(level: StatusLevel): String = when (level) {
+    StatusLevel.OK -> "已就绪"
+    StatusLevel.DEGRADED -> "降级运行"
+    StatusLevel.BAD -> "未就绪"
+}
+
+/** 状态灯配色 */
+private fun statusColor(level: StatusLevel): Color = when (level) {
+    StatusLevel.OK -> InkSuccess
+    StatusLevel.DEGRADED -> InkWarning
+    StatusLevel.BAD -> InkError
+}
+
+/**
+ * 单行状态灯。
+ *
+ * @param hint 非空时在下一行用小字补充说明。这是为了讲清"降级"到底降了什么——
+ *             否则用户只会看到一个黄灯，却不知道该怎么办。
+ */
 @Composable
-fun StatusItem(label: String, isOk: Boolean) {
-    Row(
+fun StatusItem(label: String, level: StatusLevel, hint: String? = null) {
+    Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically
+            .padding(vertical = 6.dp)
     ) {
-        Box(
-            modifier = Modifier
-                .size(8.dp)
-                .clip(CircleShape)
-                .background(if (isOk) InkSuccess else InkError)
-        )
-        Spacer(modifier = Modifier.width(10.dp))
-        Text(
-            text = label,
-            style = MaterialTheme.typography.bodyMedium,
-            color = InkSecondary,
-            modifier = Modifier.weight(1f)
-        )
-        Text(
-            text = if (isOk) "已就绪" else "未就绪",
-            style = MaterialTheme.typography.bodyMedium,
-            color = if (isOk) InkSuccess else InkError
-        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(statusColor(level))
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodyMedium,
+                color = InkSecondary,
+                modifier = Modifier.weight(1f)
+            )
+            Text(
+                text = statusText(level),
+                style = MaterialTheme.typography.bodyMedium,
+                color = statusColor(level)
+            )
+        }
+        if (hint != null) {
+            Text(
+                text = hint,
+                fontSize = 12.sp,
+                lineHeight = 16.sp,
+                color = InkSecondary,
+                modifier = Modifier.padding(start = 18.dp, top = 2.dp)
+            )
+        }
     }
 }
 

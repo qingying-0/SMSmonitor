@@ -27,4 +27,15 @@ object Prefs {
 
     /** 已完成的最近截止时刻，用于幂等与补检判定 */
     const val KEY_TASK_LAST_DEADLINE = "task_last_deadline"
+
+    // ── 权限申请留痕 ──
+    /**
+     * 是否已经弹过系统权限申请框。
+     *
+     * `shouldShowRequestPermissionRationale()` 在"从未申请过"和"已被永久拒绝"
+     * 两种情况下都返回 false，只有结合这个标志才能区分二者，
+     * 从而在被永久拒绝时改为引导用户去系统设置页。
+     */
+    const val KEY_PERM_SMS_ASKED = "perm_sms_asked"
+    const val KEY_PERM_NOTIFICATION_ASKED = "perm_notification_asked"
 }

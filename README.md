@@ -57,6 +57,8 @@
 | 双通道捕获 | 静态广播 + ContentObserver + 服务内动态广播 |
 | 四路兜底 | 主闹钟 / 备用闹钟 / WorkManager 巡检 / 启动补检 |
 | 权限自检面板 | 主页实时显示各项权限与服务状态，缺哪个就显示对应申请按钮 |
+| 权限降级提示 | 只授予"接收短信"却拒绝"读取短信"时，明确标记为**降级运行**并说明哪条通道失效 |
+| 永久拒绝引导 | 用户勾选"不再询问"后，按钮改为"去设置开权限"，点击直接跳系统设置页 |
 
 ---
 
@@ -392,6 +394,32 @@ AudioAttributes.USAGE_ALARM + CONTENT_TYPE_SONIFICATION
 
 > **本应用不申请 `INTERNET` 权限。** 这是刻意的，也是它隐私承诺的技术基础——没有网络权限，数据在物理上就无法外传。**引入任何需要联网的依赖前请三思**。
 
+### 短信权限是三态，不是布尔值
+
+`RECEIVE_SMS` 和 `READ_SMS` 是两个**独立**权限，可以被单独授予。所以 `SmsPermission` 是枚举而非 `Boolean`：
+
+| 状态 | 含义 | 界面表现 |
+|---|---|---|
+| `FULL` | 两条权限都拿到 | 绿灯「已就绪」 |
+| `RECEIVE_ONLY` | 只有接收权限 | **黄灯「降级运行」** + 说明"缺少「读取短信」权限，ContentObserver 兜底通道未生效" |
+| `NONE` | 两条都没有 | 红灯「未就绪」 |
+
+`RECEIVE_ONLY` 是最容易被忽略的状态：应用**看起来一切正常**，广播通道（①②）也照常工作，但那条唯一不依赖系统广播的兜底通道（③）已经静默失效了——而这恰恰是它存在的理由。因此这个中间态必须显式暴露给用户，不能显示成"已就绪"。
+
+状态灯因此也是三级的（`StatusLevel`），而不是原来的"就绪/未就绪"二选一。
+
+### 权限被永久拒绝后的引导
+
+用户勾选"不再询问"后，再调用系统权限弹窗**不会有任何反应**（既不弹窗也不报错），按钮会变成看起来坏掉的死按钮。
+
+判定逻辑：`shouldShowRequestPermissionRationale()` 在"**从未申请过**"和"**已被永久拒绝**"两种情况下**都**返回 `false`，单靠它无法区分。因此额外用 `Prefs.KEY_PERM_SMS_ASKED` / `KEY_PERM_NOTIFICATION_ASKED` 持久化"是否已经弹过申请框"，只有三者同时成立才认定为永久拒绝：
+
+```
+已申请过  &&  仍未授予  &&  系统不再愿意展示理由
+```
+
+此时按钮文案改为「去设置开权限」，点击直接跳转应用详情页。
+
 ---
 
 ## 数据存储
@@ -412,6 +440,7 @@ AudioAttributes.USAGE_ALARM + CONTENT_TYPE_SONIFICATION
 | `task_keyword` | `String` | `""` | 指定关键字（**必填**） |
 | `task_last_at` / `task_last_outcome` / `task_last_hits` | `Long`/`String`/`Int` | — | 上次检查结果，供主页展示 |
 | `task_last_deadline` | `Long` | `0` | **已完成的最近截止时刻，幂等判定的锚点** |
+| `perm_sms_asked` / `perm_notification_asked` | `Bool` | `false` | 是否已弹过权限申请框，用于判定"永久拒绝" |
 
 日志用 `org.json` 手工序列化（`AlarmLog.kt`），**没有引入任何新依赖**。`parseOutcome()` 保留了旧版本仅有 `matched` / `started` 字段的兼容逻辑。
 
@@ -479,8 +508,11 @@ SMSmonitor/
 | 日志条数上限 / 正文长度 | `AlarmLog` 的 `MAX_ENTRIES` / `BODY_MAX_LEN` |
 | "任务已失效"的判定时长 | `MainActivity.kt` 顶部的 `STALE_AFTER_MS`（默认 30 小时） |
 | 回看时长的可选范围 | `CheckTaskDialog` 里 `Slider` 的 `valueRange`（当前 5–240 分钟，与存储层 1–1440 的钳制范围不同） |
-| 界面卡片顺序 | `HomePage()` 的 `Column`（约 473–629 行） |
-| 界面配色 | `ui/theme/Color.kt`（`Ink*` 前缀）与 `channelColor()` / `outcomeColor()` |
+| 短信权限的三态判定 | `resolveSmsPermission()`（纯函数，有单测）与 `SmsPermission` 枚举 |
+| 状态灯的颜色与文案 | `statusColor()` / `statusText()`，以及 `StatusLevel` 枚举 |
+| 权限永久拒绝的判定 | `isPermanentlyDenied()` |
+| 界面卡片顺序 | `HomePage()` 里那个 `Column` 的子项顺序 |
+| 界面配色 | `ui/theme/Color.kt`（`Ink*` 前缀）与 `channelColor()` / `outcomeColor()` / `statusColor()` |
 | 日志筛选分类 | `LogFilter` 枚举（`ALL` / `SMS` / `TASK`） |
 | 依赖版本 | `gradle/libs.versions.toml` |
 
@@ -522,6 +554,12 @@ SMSmonitor/
 10. **不要把 `local.properties` 提交上去。**
 
 11. **时间计算一律用 `Calendar`，不要硬编码毫秒数**，并且把 `now` 作为参数传入以保持可测试性。
+
+12. **不要把 `SmsPermission` 简化回 `Boolean`。**
+    `READ_SMS` 被单独拒绝时，兜底通道会静默失效，而界面看起来一切正常。三态是有意设计，`SmsPermissionTest` 锁定了它。
+
+13. **权限判定要区分"从未申请"和"已被永久拒绝"。**
+    两者在 `shouldShowRequestPermissionRationale()` 上表现相同，必须结合 `Prefs.KEY_PERM_*_ASKED` 才能区分，否则永远走不到"去设置开权限"这条路径。
 
 ---
 
@@ -571,6 +609,17 @@ SMSmonitor/
 
 要用好这套单测，**保持 `TaskAlarmScheduler` 和 `SmsLookup` 里的函数是纯函数**（不碰 Android API）是关键。
 
+`app/src/test/.../SmsPermissionTest.kt` 是第二个纯 JVM 单测，固定 **`resolveSmsPermission()` 的四种授予组合**——尤其锁定"只有接收权限 → `RECEIVE_ONLY`"这条，防止以后有人把它简化回 Boolean，重新引入"兜底通道静默失效却显示已就绪"的问题。
+
+当前共 **31 项测试**，全部通过：
+
+```bash
+./gradlew :app:testDebugUnitTest
+# CheckTaskLogicTest   25 项
+# SmsPermissionTest     5 项
+# ExampleUnitTest       1 项（模板自带）
+```
+
 `app/src/androidTest/` 下只有模板生成的 `ExampleInstrumentedTest`。
 
 ---
@@ -583,8 +632,6 @@ SMSmonitor/
 - **日志只保留 200 条**，超出丢弃最旧的，且存在 `SharedPreferences` 里（不做大数据量设计）。
 - **`SCHEDULE_EXACT_ALARM` 在部分 ROM 上默认关闭**，此时定时检查降级为"仅依赖 15 分钟兜底巡检"，最多晚 15 分钟。界面会提示。
 - **`UNVERIFIABLE`（读不到短信）按"未收到"处理**——宁可误报不可漏报。如果你更在意误报，需要改 `CheckRunner` 里 `outcome != CheckOutcome.FOUND` 这个判断。
-- **短信权限状态只检查了 `RECEIVE_SMS`，没检查 `READ_SMS`。** 如果用户单独拒绝了 `READ_SMS`，界面仍会显示"已就绪"，但 ContentObserver 通道（③）会**静默失效**，只剩广播通道（①②）在工作。这是目前一个真实的盲点。
-- **没有权限被永久拒绝后的引导。** 没有使用 `shouldShowRequestPermissionRationale`，用户勾选"不再询问"后只能自己去系统设置里改。
 - **只有浅色主题。** `SMSmonitorTheme` 基于 `InkLightColorScheme`，没有深色模式分支。
 - **应用只有一个 Activity、没有导航**，所有界面是同一个滚动页 + 三个 Dialog。
 
