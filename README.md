@@ -3,6 +3,39 @@
 > 收到含指定关键字的短信 → 立刻响闹钟；到点却没收到该短信 → 也响闹钟。
 
 一个**纯本地**的 Android 短信关键字告警应用。不申请网络权限，不上传任何数据，没有账号、没有服务端。
+---
+
+## 给 AI 编程助手的上下文提示
+
+如果你打算用 Claude Code / Cursor / Copilot 等工具改这个项目，建议先把下面这段喂给它：
+
+```text
+项目：SMSmonitor，一个纯本地 Android 短信关键字告警应用。
+技术栈：Kotlin 2.2.10 + Jetpack Compose（Material3）+ AGP 9.3.0 + Gradle 9.5 + JDK 25，
+       minSdk 26 / targetSdk 37，无 ViewModel / 无 DI / 无数据库。
+
+架构要点：
+- 全部状态存 SharedPreferences（常量集中在 Prefs.kt），通过 kotlin object 单例访问。
+- 短信捕获有三条路径：静态广播（进程被杀也能拉起）、服务内动态广播、ContentObserver。
+  三者都会看到同一条短信，靠 TriggerGate 按正文哈希做 5 秒去重；响铃另有 1 秒冷却。
+- 所有路径统一调用 SmsTrigger.handle()，不要绕过它直接响铃。
+- 响铃必须经 AlarmScheduler 精准闹钟中转（Android 12+ 后台启动前台服务限制），
+  失败时降级为 AlarmService.start()。绝不能在 BroadcastReceiver 里直接 startForegroundService。
+- 定时检查任务用「最近一个已过去的截止时刻」作为幂等锚点（CheckRunner.runIfDue），
+  四条路径（主闹钟/备用闹钟/WorkManager 巡检/启动补检）重复触发只会响一次。
+- 界面全在 MainActivity.kt（约 1560 行，Compose 函数式组件，无 ViewModel）。
+
+修改时必须遵守：
+1. 不要破坏 TriggerGate 去重与 CheckRunner 幂等（先落盘再响铃）。
+2. nextTriggerAt 与 mostRecentDeadline 必须成对修改，并跑 CheckTaskLogicTest。
+3. 新增 TriggerChannel / AlarmOutcome 枚举值要给 label 文案。
+4. 不要申请 INTERNET 权限或引入网络依赖。
+5. 时间计算用 Calendar 且把 now 作为参数传入（为了可测）。
+6. 改完至少跑 ./gradlew :app:assembleDebug 与 :app:testDebugUnitTest。
+```
+
+---
+
 
 ![通知效果：上方为监控常驻通知，下方为命中关键字后的闹钟通知](app_icon_preview.png)
 
@@ -561,38 +594,6 @@ SMSmonitor/
 13. **权限判定要区分"从未申请"和"已被永久拒绝"。**
     两者在 `shouldShowRequestPermissionRationale()` 上表现相同，必须结合 `Prefs.KEY_PERM_*_ASKED` 才能区分，否则永远走不到"去设置开权限"这条路径。
 
----
-
-## 给 AI 编程助手的上下文提示
-
-如果你打算用 Claude Code / Cursor / Copilot 等工具改这个项目，建议先把下面这段喂给它：
-
-```text
-项目：SMSmonitor，一个纯本地 Android 短信关键字告警应用。
-技术栈：Kotlin 2.2.10 + Jetpack Compose（Material3）+ AGP 9.3.0 + Gradle 9.5 + JDK 25，
-       minSdk 26 / targetSdk 37，无 ViewModel / 无 DI / 无数据库。
-
-架构要点：
-- 全部状态存 SharedPreferences（常量集中在 Prefs.kt），通过 kotlin object 单例访问。
-- 短信捕获有三条路径：静态广播（进程被杀也能拉起）、服务内动态广播、ContentObserver。
-  三者都会看到同一条短信，靠 TriggerGate 按正文哈希做 5 秒去重；响铃另有 1 秒冷却。
-- 所有路径统一调用 SmsTrigger.handle()，不要绕过它直接响铃。
-- 响铃必须经 AlarmScheduler 精准闹钟中转（Android 12+ 后台启动前台服务限制），
-  失败时降级为 AlarmService.start()。绝不能在 BroadcastReceiver 里直接 startForegroundService。
-- 定时检查任务用「最近一个已过去的截止时刻」作为幂等锚点（CheckRunner.runIfDue），
-  四条路径（主闹钟/备用闹钟/WorkManager 巡检/启动补检）重复触发只会响一次。
-- 界面全在 MainActivity.kt（约 1560 行，Compose 函数式组件，无 ViewModel）。
-
-修改时必须遵守：
-1. 不要破坏 TriggerGate 去重与 CheckRunner 幂等（先落盘再响铃）。
-2. nextTriggerAt 与 mostRecentDeadline 必须成对修改，并跑 CheckTaskLogicTest。
-3. 新增 TriggerChannel / AlarmOutcome 枚举值要给 label 文案。
-4. 不要申请 INTERNET 权限或引入网络依赖。
-5. 时间计算用 Calendar 且把 now 作为参数传入（为了可测）。
-6. 改完至少跑 ./gradlew :app:assembleDebug 与 :app:testDebugUnitTest。
-```
-
----
 
 ## 测试
 
